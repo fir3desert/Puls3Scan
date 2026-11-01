@@ -1,32 +1,40 @@
-//! Puls3Scan: escáner SYN stateless (estilo masscan) con dos modos:
-//!   -a <ip|dominio>       -> un host, todos los puertos por defecto
+//! Puls3Scan: escáner de puertos rápido con dos motores:
+//!   * SYN stateless (estilo masscan): raw sockets, cookies SYN, filtro BPF en el kernel.
+//!   * connect() asíncrono con epoll (estilo RustScan, pero sin hilos por conexión).
+//!
+//! Dos modos de uso:
+//!   -a <ip|dominio|cidr>  -> un objetivo (un host: todos los puertos por defecto)
 //!   range <cidr>...       -> rangos grandes, orden pseudoaleatorio
-//! Requiere root o CAP_NET_RAW. Úsalo solo contra redes que tengas autorización para escanear.
+//!
+//! El escaneo arranca a la vez que la animación del banner; los resultados se
+//! muestran en cuanto la animación termina (o al instante si no hay animación).
+//! SYN requiere root o CAP_NET_RAW (si no hay permisos, en modo auto cae a connect).
+//! Úsalo solo contra redes que tengas autorización para escanear.
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ipnetwork::Ipv4Network;
-use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpFlags};
-use pnet::transport::{
-    tcp_packet_iter, transport_channel, TransportChannelType::Layer4, TransportProtocol::Ipv4,
-};
-use std::collections::{hash_map::DefaultHasher, HashSet};
-use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
 const COMMON_PORTS: &str =
     "21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5432,5900,8080,8443";
 
+/// Tras el último envío SYN: si ya hubo respuestas y pasa este tiempo sin ninguna
+/// nueva, se termina sin esperar el `--wait-ms` completo.
+const QUIET_MS: u64 = 400;
+
 #[derive(Parser)]
-#[command(name = "pscan", about = "Puls3Scan: escáner SYN stateless rápido")]
+#[command(name = "pscan", about = "Puls3Scan: escáner de puertos rápido (SYN stateless + connect con epoll)")]
 struct Cli {
-    /// Escanea un solo objetivo: IP o nombre de dominio (por defecto, los 65535 puertos)
-    #[arg(short = 'a', long = "address", value_name = "IP|DOMINIO")]
+    /// Escanea un objetivo: IP, dominio o red CIDR (p. ej. 192.168.0.0/23).
+    /// Un solo host: todos los puertos; una red: puertos comunes (salvo -p)
+    #[arg(short = 'a', long = "address", value_name = "IP|DOMINIO|CIDR")]
     address: Option<String>,
     #[command(flatten)]
     common: Common,
@@ -48,39 +56,40 @@ enum Cmd {
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
-    /// SYN en crudo si es fiable; connect() automáticamente en WSL2 con NAT
+    /// SYN en crudo si es posible; connect() en WSL2 con NAT o si no hay permisos de root
     Auto,
     /// SYN stateless (rápido; requiere root y red "real")
     Syn,
-    /// connect() normal del kernel (lento pero funciona a través de NAT/WSL2)
+    /// connect() asíncrono con epoll (funciona a través de NAT/WSL2 y sin root)
     Connect,
 }
 
 #[derive(Args)]
 struct Common {
     /// Puertos: "-p 22", "-p 80,443,8000-9000"; "-p" sin valor = todos (1-65535).
-    /// Sin -p: host = todos, range = puertos comunes
+    /// Sin -p: un solo host = todos; red/rango (-a CIDR o range) = puertos comunes
     #[arg(global = true, short, long, num_args = 0..=1, default_missing_value = "1-65535")]
     ports: Option<String>,
-    /// Paquetes por segundo en modo syn (por defecto: 10000 en un host, 100000 en rangos)
+    /// Paquetes por segundo en modo syn (por defecto: 100000)
     #[arg(global = true, short, long)]
     rate: Option<u64>,
     /// Método de escaneo
     #[arg(global = true, long, value_enum, default_value_t = Mode::Auto)]
     mode: Mode,
-    /// Conexiones simultáneas en modo connect
-    #[arg(global = true, long, default_value_t = 400)]
-    workers: usize,
-    /// Timeout por conexión en modo connect (ms)
-    #[arg(global = true, long, default_value_t = 800)]
+    /// Sockets simultáneos en modo connect (como el batch de RustScan; se limita al ulimit)
+    #[arg(global = true, short = 'b', long, visible_alias = "workers", default_value_t = 8000)]
+    batch: usize,
+    /// Timeout por conexión en modo connect (ms). En LAN/localhost puedes bajarlo a 200-300
+    #[arg(global = true, long, default_value_t = 1000)]
     timeout_ms: u64,
-    /// Hilos de envío
+    /// Hilos: de envío en modo syn, motores epoll en modo connect
     #[arg(global = true, short, long, default_value_t = 2)]
     threads: usize,
-    /// Segundos de espera de respuestas tras el último envío
-    #[arg(global = true, long, default_value_t = 3)]
-    wait: u64,
-    /// Reintentos (pasadas extra sobre todo el espacio)
+    /// Espera máxima de respuestas tras el último envío SYN (ms). Se acorta sola si
+    /// ya hubo respuestas y luego hay 400 ms de silencio
+    #[arg(global = true, long, default_value_t = 1200)]
+    wait_ms: u64,
+    /// Reintentos (pasadas extra en syn; reintentos por timeout en connect)
     #[arg(global = true, long, default_value_t = 0)]
     retries: u32,
     /// Semilla del orden aleatorio (reproducible)
@@ -98,7 +107,7 @@ struct Common {
     /// Duración del barrido de carga del banner en ms (0 = sin animación; la ola posterior dura ~2.6 s)
     #[arg(global = true, long, default_value_t = ANIM_DEFAULT_MS, value_name = "MS")]
     anim_ms: u64,
-    /// Muestra detalles del escaneo (modo, workers, avisos de WSL2...)
+    /// Muestra detalles del escaneo (modo, sockets, avisos de WSL2...)
     #[arg(global = true, short, long)]
     verbose: bool,
     /// Guarda resultados "ip:puerto", uno por línea
@@ -110,6 +119,84 @@ struct Common {
     /// Guarda los puertos abiertos (únicos) como array JSON (-op)
     #[arg(global = true, long = "op", value_name = "FICHERO")]
     out_ports: Option<String>,
+}
+
+// ---------- Salida compartida ----------
+//
+// El escaneo corre a la vez que la animación del banner. La animación redibuja
+// el banner subiendo el cursor, así que nada más puede escribir en pantalla
+// mientras dura: `Out` encola las líneas y las vuelca (en orden) cuando acaba.
+
+struct OutState {
+    animating: bool,
+    queue: Vec<(bool, String)>, // (es_stderr, texto)
+}
+
+struct Out {
+    st: Mutex<OutState>,
+    /// ¿colorear stdout / stderr?
+    oc: bool,
+    ec: bool,
+}
+
+impl Out {
+    fn new() -> Arc<Out> {
+        Arc::new(Out {
+            st: Mutex::new(OutState { animating: false, queue: Vec::new() }),
+            oc: color_on(std::io::stdout().is_terminal()),
+            ec: color_on(std::io::stderr().is_terminal()),
+        })
+    }
+    fn lock(&self) -> MutexGuard<'_, OutState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn write(is_err: bool, s: &str) {
+        if is_err {
+            write_stderr(&format!("{s}\n"));
+        } else {
+            let mut o = std::io::stdout().lock();
+            let _ = writeln!(o, "{s}"); // sin panic si el pipe se cierra (| head)
+        }
+    }
+    fn emit(&self, is_err: bool, s: String) {
+        let mut g = self.lock();
+        if g.animating {
+            g.queue.push((is_err, s));
+        } else {
+            Self::write(is_err, &s);
+        }
+    }
+    /// Línea de resultado (stdout).
+    fn line(&self, s: String) {
+        self.emit(false, s);
+    }
+    /// Línea informativa (stderr).
+    fn err(&self, s: String) {
+        self.emit(true, s);
+    }
+    fn begin_anim(&self) {
+        self.lock().animating = true;
+    }
+    fn end_anim(&self) {
+        let mut g = self.lock();
+        g.animating = false;
+        for (e, s) in g.queue.drain(..) {
+            Self::write(e, &s);
+        }
+    }
+}
+
+/// Garantiza que la cola se vuelque aunque el hilo de la animación falle.
+struct EndAnim(Arc<Out>);
+impl Drop for EndAnim {
+    fn drop(&mut self) {
+        self.0.end_anim();
+    }
+}
+
+fn hit_line(ip: Ipv4Addr, port: u16, color: bool) -> String {
+    let sep = if color { "\x1b[2m:\x1b[0m" } else { ":" };
+    format!("{}{}{}", paint_ip(ip, color), sep, paint_port(port, color))
 }
 
 // ---------- Permutación pseudoaleatoria (Feistel + cycle walking) ----------
@@ -164,11 +251,13 @@ impl Perm {
 
 // ---------- Cookie SYN ----------
 
+/// Cookie sin SipHash: dos rondas de splitmix con la clave secreta de la ejecución.
 #[inline]
 fn cookie(secret: u64, ip: u32, dport: u16, sport: u16) -> u32 {
-    let mut h = DefaultHasher::new();
-    (secret, ip, dport, sport).hash(&mut h);
-    h.finish() as u32
+    let mut x = secret ^ (((ip as u64) << 32) | ((dport as u64) << 16) | (sport as u64));
+    let a = splitmix(&mut x);
+    let mut y = a ^ secret.rotate_left(32);
+    splitmix(&mut y) as u32
 }
 
 #[inline]
@@ -207,12 +296,12 @@ const PHRASES: &[&str] = &[
 /// Versión (sale de Cargo.toml) y arte del banner.
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const BANNER: &str = r#"
-██████╗ ██╗   ██╗██╗     ███████╗███████╗███████╗ ██████╗ █████╗ ███╗   ██╗
-██╔══██╗██║   ██║██║     ██╔════╝██╔════╝██╔════╝██╔════╝██╔══██╗████╗  ██║
-██████╔╝██║   ██║██║     ███████╗█████╗  ███████╗██║     ███████║██╔██╗ ██║
-██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝  ╚════██║██║     ██╔══██║██║╚██╗██║
-██║     ╚██████╔╝███████╗███████║███████╗███████║╚██████╗██║  ██║██║ ╚████║
-╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝"#;
+██████╗ ██╗   ██╗██╗     ███████╗██████╗ ███████╗ ██████╗ █████╗ ███╗   ██╗
+██╔══██╗██║   ██║██║     ██╔════╝╚════██╗██╔════╝██╔════╝██╔══██╗████╗  ██║
+██████╔╝██║   ██║██║     ███████╗ █████╔╝███████╗██║     ███████║██╔██╗ ██║
+██╔═══╝ ██║   ██║██║     ╚════██║ ╚═══██╗╚════██║██║     ██╔══██║██║╚██╗██║
+██║     ╚██████╔╝███████╗███████║██████╔╝███████║╚██████╗██║  ██║██║ ╚████║
+╚═╝      ╚═════╝ ╚══════╝╚══════╝╚═════╝ ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝"#;
 
 fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
@@ -276,8 +365,10 @@ fn paint_port(p: u16, on: bool) -> String {
 //
 // Animación: un barrido en diagonal (de arriba-izquierda a abajo-derecha) va
 // "encendiendo" las letras con el degradado naranja -> blanco. Al terminar, el
-// frame final queda impreso como banner estático. Todo es cosmético: ningún
-// fallo de terminal aborta el escaneo.
+// frame final queda impreso como banner estático. Corre en su propio hilo
+// MIENTRAS el escaneo ya está en marcha. Si el escaneo termina antes que la ola
+// de brillo, la ola se corta y se deja el banner final (el barrido siempre se
+// ve completo). Todo es cosmético: ningún fallo de terminal aborta el escaneo.
 
 /// Frames por segundo de la animación.
 const ANIM_FPS: u64 = 60;
@@ -398,7 +489,7 @@ fn print_banner(color: bool, phrase: &str) {
 }
 
 /// Ctrl+C / SIGTERM durante la animación: vuelve a mostrar el cursor (solo Unix,
-/// sin dependencias; únicamente funciones async-signal-safe).
+/// únicamente funciones async-signal-safe).
 #[cfg(unix)]
 mod sig {
     extern "C" {
@@ -468,11 +559,11 @@ impl Drop for CursorGuard {
 }
 
 /// Animación en el sitio, en dos fases: (1) barrido de carga que enciende las
-/// letras y (2) ola de brillo diagonal, de izquierda a derecha, que se va
-/// apagando hasta dejar el degradado final. Redibuja el banner subiendo el
-/// cursor al inicio en cada frame; el último frame (banner completo) queda
-/// impreso con el cursor justo debajo.
-fn animate_banner(ms: u64, phrase: &str) {
+/// letras y (2) ola de brillo diagonal que se va apagando hasta dejar el
+/// degradado final. Redibuja el banner subiendo el cursor al inicio en cada
+/// frame; el último frame (banner completo) queda impreso con el cursor justo
+/// debajo. Si `scan_done` se activa durante la ola, salta al frame final.
+fn animate_banner(ms: u64, phrase: &str, scan_done: &AtomicBool) {
     let lines = banner_lines();
     let width = banner_width(&lines);
     let up = lines.len() + EXTRA_ROWS;
@@ -482,7 +573,10 @@ fn animate_banner(ms: u64, phrase: &str) {
     let _guard = CursorGuard::hide();
     let start = Instant::now();
     for n in 0..=(sweep + wave) {
-        let (reveal, w) = if n <= sweep {
+        let finish_now = n > sweep && scan_done.load(Ordering::Relaxed);
+        let (reveal, w) = if finish_now {
+            (1.0, (0.0, 0.0))
+        } else if n <= sweep {
             (n as f64 / sweep as f64, (0.0, 0.0))
         } else {
             let t = (n - sweep) as f64 / wave as f64; // 0.0..=1.0
@@ -495,7 +589,7 @@ fn animate_banner(ms: u64, phrase: &str) {
             f.push_str(&format!("\x1b[{up}A\r")); // subir al inicio del banner
         }
         f.push_str(&banner_frame(&lines, width, reveal, w, phrase));
-        if !write_stderr(&f) {
+        if !write_stderr(&f) || finish_now {
             break;
         }
         if n < sweep + wave {
@@ -544,21 +638,31 @@ fn anim_allowed(c: &Common, color: bool, width: usize, height: usize) -> bool {
         && term_size().map_or(true, |(rows, cols)| cols >= width && rows > height)
 }
 
-/// Punto de entrada del banner. Solo stderr y solo si es un TTY. Imprime en
-/// línea (continúa donde estaba el cursor) y termina antes de lanzar el escaneo.
-fn show_banner(c: &Common) {
+/// Punto de entrada del banner. Solo stderr y solo si es un TTY. Si hay
+/// animación, arranca en un HILO y devuelve su handle: el llamador puede lanzar
+/// el escaneo de inmediato y hacer `join` cuando termine. Mientras la animación
+/// vive, `out` encola todo lo que se imprima. Sin animación el banner se
+/// imprime al instante (estático) y devuelve None.
+fn start_banner(c: &Common, out: &Arc<Out>, scan_done: &Arc<AtomicBool>) -> Option<thread::JoinHandle<()>> {
     if c.no_banner || !std::io::stderr().is_terminal() {
-        return;
+        return None;
     }
     let color = color_on(true); // NO_COLOR => banner plano, sin animación
     let lines = banner_lines();
     let (width, height) = (banner_width(&lines), lines.len() + EXTRA_ROWS);
     let phrase = random_phrase();
-    write_stderr("\n");
     if anim_allowed(c, color, width, height) {
-        animate_banner(c.anim_ms, phrase);
+        out.begin_anim(); // antes de lanzar el hilo: sin carreras con el escaneo
+        let (out, done, ms) = (out.clone(), scan_done.clone(), c.anim_ms);
+        Some(thread::spawn(move || {
+            let _end = EndAnim(out);
+            write_stderr("\n");
+            animate_banner(ms, phrase, &done);
+        }))
     } else {
+        write_stderr("\n");
         print_banner(color, phrase);
+        None
     }
 }
 
@@ -622,24 +726,190 @@ fn detect_src(dst: u32) -> Ipv4Addr {
         .unwrap_or(Ipv4Addr::UNSPECIFIED)
 }
 
-// ---------- Motor ----------
+// ---------- Trabajo a repartir ----------
 
 struct Job {
     ranges: Vec<(u32, u64)>,
-    excl: Vec<(u32, u64)>,
+    /// Índice acumulado donde empieza cada rango (para buscar por bisección).
+    cum: Vec<u64>,
+    /// Exclusiones normalizadas: [inicio, fin) ordenadas y sin solapes.
+    excl: Vec<(u64, u64)>,
     ports: Vec<u16>,
     total_ips: u64,
 }
 
-fn ip_at(ranges: &[(u32, u64)], mut idx: u64) -> u32 {
-    for &(start, count) in ranges {
-        if idx < count {
-            return start.wrapping_add(idx as u32);
+impl Job {
+    fn new(ranges: Vec<(u32, u64)>, excl: Vec<(u32, u64)>, ports: Vec<u16>) -> Job {
+        let mut cum = Vec::with_capacity(ranges.len());
+        let mut acc = 0u64;
+        for r in &ranges {
+            cum.push(acc);
+            acc += r.1;
         }
-        idx -= count;
+        let mut ex: Vec<(u64, u64)> = excl.iter().map(|&(s, c)| (s as u64, s as u64 + c)).collect();
+        ex.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ex.len());
+        for (s, e) in ex {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        Job { ranges, cum, excl: merged, ports, total_ips: acc }
     }
-    unreachable!()
+    /// IP número `idx` del espacio de objetivos (búsqueda binaria, O(log n)).
+    #[inline]
+    fn ip_at(&self, idx: u64) -> u32 {
+        let k = self.cum.partition_point(|&c| c <= idx) - 1;
+        self.ranges[k].0.wrapping_add((idx - self.cum[k]) as u32)
+    }
+    #[inline]
+    fn is_excluded(&self, ip: u32) -> bool {
+        if self.excl.is_empty() {
+            return false;
+        }
+        let ip = ip as u64;
+        let k = self.excl.partition_point(|&(s, _)| s <= ip);
+        k > 0 && ip < self.excl[k - 1].1
+    }
 }
+
+// ---------- Raw sockets (SYN) ----------
+
+#[cfg(target_os = "linux")]
+mod raw {
+    use std::net::Ipv4Addr;
+    use std::os::raw::c_void;
+
+    pub struct RawSock(pub i32);
+    impl Drop for RawSock {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+
+    fn open() -> Result<RawSock, String> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_TCP) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(RawSock(fd))
+    }
+
+    /// Filtro BPF clásico: el kernel descarta lo que no pase, sin copiarlo a userspace.
+    fn attach(fd: i32, prog: &mut [libc::sock_filter]) {
+        let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_mut_ptr() };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ATTACH_FILTER,
+                &fprog as *const _ as *const c_void,
+                std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+            );
+        }
+    }
+
+    fn ins(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+
+    /// Socket de envío: no necesita recibir nada (filtro "descartar todo"), así
+    /// el kernel no copia cada respuesta TCP a los sockets de los hilos emisores.
+    pub fn send_sock() -> Result<RawSock, String> {
+        let s = open()?;
+        attach(s.0, &mut [ins(0x06, 0, 0, 0)]); // ret 0
+        Ok(s)
+    }
+
+    /// Socket de recepción: solo SYN+ACK (los RST de los puertos cerrados no
+    /// llegan nunca a userspace), buffer de 32 MB y timeout de 20 ms en recv.
+    pub fn recv_sock() -> Result<RawSock, String> {
+        let s = open()?;
+        let mut prog = [
+            ins(0xb1, 0, 0, 0),    // ldx 4*([0]&0xf)   -> X = longitud de la cabecera IP
+            ins(0x50, 0, 0, 13),   // ldb [x+13]         -> flags TCP
+            ins(0x54, 0, 0, 0x12), // and #0x12          -> SYN|ACK
+            ins(0x15, 0, 1, 0x12), // jeq #0x12 ? sig : saltar
+            ins(0x06, 0, 0, 0xffff), // ret 65535 (aceptar)
+            ins(0x06, 0, 0, 0),    // ret 0 (descartar)
+        ];
+        attach(s.0, &mut prog);
+        unsafe {
+            let sz: libc::c_int = 32 << 20;
+            let p = &sz as *const _ as *const c_void;
+            let l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            if libc::setsockopt(s.0, libc::SOL_SOCKET, libc::SO_RCVBUFFORCE, p, l) != 0 {
+                libc::setsockopt(s.0, libc::SOL_SOCKET, libc::SO_RCVBUF, p, l);
+            }
+            let tv = libc::timeval { tv_sec: 0, tv_usec: 20_000 };
+            libc::setsockopt(
+                s.0,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+        Ok(s)
+    }
+
+    /// Envía un segmento TCP. 0 = ok; si no, el errno.
+    #[inline]
+    pub fn send_to(fd: i32, buf: &[u8], dst: Ipv4Addr) -> i32 {
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(dst.octets()) },
+            sin_zero: [0; 8],
+        };
+        let r = unsafe {
+            libc::sendto(
+                fd,
+                buf.as_ptr() as *const c_void,
+                buf.len(),
+                0,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if r < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) } else { 0 }
+    }
+
+    #[inline]
+    pub fn recv(fd: i32, buf: &mut [u8]) -> isize {
+        unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) }
+    }
+
+    pub fn is_retryable(errno: i32) -> bool {
+        errno == libc::ENOBUFS || errno == libc::EAGAIN || errno == libc::EINTR
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod raw {
+    use std::net::Ipv4Addr;
+    pub struct RawSock(pub i32);
+    pub fn send_sock() -> Result<RawSock, String> {
+        Err("el modo syn en crudo solo está soportado en Linux".into())
+    }
+    pub fn recv_sock() -> Result<RawSock, String> {
+        Err("el modo syn en crudo solo está soportado en Linux".into())
+    }
+    pub fn send_to(_: i32, _: &[u8], _: Ipv4Addr) -> i32 {
+        -1
+    }
+    pub fn recv(_: i32, _: &mut [u8]) -> isize {
+        -1
+    }
+    pub fn is_retryable(_: i32) -> bool {
+        false
+    }
+}
+
+// ---------- Motor SYN ----------
 
 #[allow(clippy::too_many_arguments)]
 fn sender(
@@ -647,19 +917,13 @@ fn sender(
     nthreads: usize,
     job: Arc<Job>,
     perm: Arc<Perm>,
+    sock: raw::RawSock,
     src: Ipv4Addr,
     secret: u64,
     rate: u64,
     retries: u32,
     sent: Arc<AtomicU64>,
 ) {
-    let (mut tx, _) = match transport_channel(4096, Layer4(Ipv4(IpNextHeaderProtocols::Tcp))) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error abriendo raw socket (¿root / CAP_NET_RAW?): {e}");
-            process::exit(1);
-        }
-    };
     let np = job.ports.len() as u64;
     let total = job.total_ips * np;
     let per_thread = (rate / nthreads as u64).max(1) as f64;
@@ -672,9 +936,9 @@ fn sender(
         while i < total {
             let x = perm.get(i);
             i += nthreads as u64;
-            let ip = ip_at(&job.ranges, x / np);
+            let ip = job.ip_at(x / np);
             let port = job.ports[(x % np) as usize];
-            if job.excl.iter().any(|&(s, c)| ip >= s && ((ip - s) as u64) < c) {
+            if job.is_excluded(ip) {
                 continue;
             }
             let c = cookie(secret, ip, port, 0);
@@ -694,7 +958,17 @@ fn sender(
             pkt.set_checksum(0);
             let ck = ipv4_checksum(&pkt.to_immutable(), &src, &dst);
             pkt.set_checksum(ck);
-            let _ = tx.send_to(pkt, IpAddr::V4(dst));
+
+            // Si el buffer de envío del kernel se llena (ENOBUFS), espera un poco y reintenta.
+            let mut tries = 0;
+            loop {
+                let e = raw::send_to(sock.0, &buf, dst);
+                if e == 0 || !raw::is_retryable(e) || tries >= 8 {
+                    break;
+                }
+                tries += 1;
+                thread::sleep(Duration::from_micros(200));
+            }
 
             n += 1;
             if n % 256 == 0 {
@@ -710,6 +984,446 @@ fn sender(
     sent.fetch_add(n % 256, Ordering::Relaxed);
 }
 
+/// Receptor SYN: lee solo SYN+ACK (el filtro BPF ya descartó el resto), valida la
+/// cookie y publica cada puerto abierto en cuanto llega.
+fn receiver(
+    sock: raw::RawSock,
+    stop: Arc<AtomicBool>,
+    secret: u64,
+    out: Arc<Out>,
+    t0: Instant,
+    last_ack: Arc<AtomicU64>,
+) -> Vec<(Ipv4Addr, u16)> {
+    let mut buf = vec![0u8; 4096];
+    let mut seen: HashSet<(u32, u16)> = HashSet::new();
+    let mut found = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let n = raw::recv(sock.0, &mut buf);
+        if n < 40 {
+            continue; // timeout (20 ms) o error: reintenta y mira `stop`
+        }
+        let p = &buf[..n as usize];
+        if p[0] >> 4 != 4 || p[9] != 6 {
+            continue;
+        }
+        let ihl = ((p[0] & 0x0f) as usize) * 4;
+        if (n as usize) < ihl + 20 {
+            continue;
+        }
+        let t = &p[ihl..];
+        if t[13] & 0x12 != 0x12 {
+            continue;
+        }
+        let dport = u16::from_be_bytes([t[0], t[1]]); // puerto del objetivo
+        let sport = u16::from_be_bytes([t[2], t[3]]); // nuestro puerto de origen
+        let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
+        let ipn = u32::from_be_bytes([p[12], p[13], p[14], p[15]]);
+        if sport != src_port_for(cookie(secret, ipn, dport, 0)) {
+            continue;
+        }
+        if ack != cookie(secret, ipn, dport, sport).wrapping_add(1) {
+            continue;
+        }
+        last_ack.store(t0.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+        if seen.insert((ipn, dport)) {
+            let ip = Ipv4Addr::from(ipn);
+            out.line(hit_line(ip, dport, out.oc));
+            found.push((ip, dport));
+        }
+    }
+    found
+}
+
+// ---------- Motor connect ----------
+
+/// Linux: connect() no bloqueante + epoll. Miles de sockets en vuelo por hilo,
+/// sin un hilo por conexión.
+#[cfg(target_os = "linux")]
+mod connect_engine {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::os::raw::c_void;
+
+    struct Slot {
+        fd: i32,
+        ip: u32,
+        port: u16,
+        tries: u32,
+        gen: u32,
+        active: bool,
+    }
+
+    enum Start {
+        Pending(i32),
+        Open(i32),
+        Closed,
+        /// Sin recursos (fds / puertos efímeros / memoria): reducir la concurrencia.
+        Backoff,
+    }
+
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    /// Sube el límite de ficheros abiertos al máximo permitido y lo devuelve.
+    pub fn nofile_limit() -> usize {
+        unsafe {
+            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+                return 1024;
+            }
+            let want = rl.rlim_max.min(1_048_576);
+            if rl.rlim_cur < want {
+                let n = libc::rlimit { rlim_cur: want, rlim_max: rl.rlim_max };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &n) == 0 {
+                    rl.rlim_cur = want;
+                }
+            }
+            rl.rlim_cur as usize
+        }
+    }
+
+    /// Auto-connect de loopback: si el puerto de origen que eligió el kernel coincide
+    /// con el de destino, la conexión se "conecta consigo misma" (falso positivo).
+    fn is_self_connect(fd: i32, ip: u32, port: u16) -> bool {
+        unsafe {
+            let mut a: libc::sockaddr_in = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            if libc::getsockname(fd, &mut a as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+                return false;
+            }
+            a.sin_port == port.to_be() && a.sin_addr.s_addr == u32::from_ne_bytes(ip.to_be_bytes())
+        }
+    }
+
+    fn start_connect(ip: u32, port: u16) -> Start {
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                return Start::Backoff;
+            }
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: port.to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.to_be_bytes()) },
+                sin_zero: [0; 8],
+            };
+            let r = libc::connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if r == 0 {
+                return Start::Open(fd);
+            }
+            match errno() {
+                libc::EINPROGRESS => Start::Pending(fd),
+                libc::EADDRNOTAVAIL | libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EAGAIN => {
+                    libc::close(fd);
+                    Start::Backoff
+                }
+                _ => {
+                    // ECONNREFUSED inmediato (loopback), red inalcanzable, etc.
+                    libc::close(fd);
+                    Start::Closed
+                }
+            }
+        }
+    }
+
+    pub fn scan(
+        job: Arc<Job>,
+        perm: Arc<Perm>,
+        batch: usize,
+        nthreads: usize,
+        timeout: Duration,
+        retries: u32,
+        out: Arc<Out>,
+    ) -> Vec<(Ipv4Addr, u16)> {
+        let per = (batch / nthreads).max(1);
+        let handles: Vec<_> = (0..nthreads)
+            .map(|id| {
+                let (job, perm, out) = (job.clone(), perm.clone(), out.clone());
+                thread::spawn(move || engine(id, nthreads, job, perm, per, timeout, retries, out))
+            })
+            .collect();
+        let mut all = Vec::new();
+        for h in handles {
+            if let Ok(mut v) = h.join() {
+                all.append(&mut v);
+            }
+        }
+        all
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn engine(
+        id: usize,
+        nthreads: usize,
+        job: Arc<Job>,
+        perm: Arc<Perm>,
+        batch: usize,
+        timeout: Duration,
+        retries: u32,
+        out: Arc<Out>,
+    ) -> Vec<(Ipv4Addr, u16)> {
+        let np = job.ports.len() as u64;
+        let total = job.total_ips * np;
+        let mut found: Vec<(Ipv4Addr, u16)> = Vec::new();
+
+        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if ep < 0 {
+            out.err(format!("[!] epoll_create1 falló (errno {})", errno()));
+            return found;
+        }
+
+        let mut slots: Vec<Slot> = Vec::with_capacity(batch);
+        let mut free: Vec<usize> = Vec::new();
+        // Todos los timeouts son iguales => los vencimientos salen ordenados (cola FIFO).
+        let mut deadlines: VecDeque<(usize, u32, Instant)> = VecDeque::new();
+        let mut retry_q: Vec<(u32, u16, u32)> = Vec::new(); // (ip, puerto, intentos hechos)
+        let mut next_i = id as u64;
+        let mut inflight = 0usize;
+        let mut cap = batch; // concurrencia actual (baja si el SO se queda sin recursos)
+        let mut stalls = 0u32;
+        let mut gen_counter = 0u32;
+        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
+
+        let hit = |found: &mut Vec<(Ipv4Addr, u16)>, ip: u32, port: u16| {
+            let ipa = Ipv4Addr::from(ip);
+            out.line(hit_line(ipa, port, out.oc));
+            found.push((ipa, port));
+        };
+
+        loop {
+            // 1) Rellenar hasta `cap` sockets en vuelo.
+            let mut backoff = false;
+            let now = Instant::now();
+            while inflight < cap {
+                let (ip, port, tries) = match retry_q.pop() {
+                    Some(p) => p,
+                    None => {
+                        let mut got = None;
+                        while next_i < total {
+                            let x = perm.get(next_i);
+                            next_i += nthreads as u64;
+                            let ip = job.ip_at(x / np);
+                            if job.is_excluded(ip) {
+                                continue;
+                            }
+                            got = Some((ip, job.ports[(x % np) as usize], 0u32));
+                            break;
+                        }
+                        match got {
+                            Some(g) => g,
+                            None => break, // no quedan sondas
+                        }
+                    }
+                };
+                match start_connect(ip, port) {
+                    Start::Pending(fd) => {
+                        gen_counter = gen_counter.wrapping_add(1);
+                        let slot = Slot { fd, ip, port, tries, gen: gen_counter, active: true };
+                        let idx = match free.pop() {
+                            Some(i) => {
+                                slots[i] = slot;
+                                i
+                            }
+                            None => {
+                                slots.push(slot);
+                                slots.len() - 1
+                            }
+                        };
+                        let mut ev = libc::epoll_event {
+                            events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+                            u64: ((gen_counter as u64) << 32) | idx as u64,
+                        };
+                        if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+                            unsafe { libc::close(fd) };
+                            slots[idx].active = false;
+                            free.push(idx);
+                            retry_q.push((ip, port, tries));
+                            backoff = true;
+                            break;
+                        }
+                        inflight += 1;
+                        deadlines.push_back((idx, gen_counter, now + timeout));
+                    }
+                    Start::Open(fd) => {
+                        let selfc = is_self_connect(fd, ip, port);
+                        unsafe { libc::close(fd) };
+                        if !selfc {
+                            hit(&mut found, ip, port);
+                        }
+                    }
+                    Start::Closed => {}
+                    Start::Backoff => {
+                        retry_q.push((ip, port, tries));
+                        backoff = true;
+                        break;
+                    }
+                }
+            }
+            if backoff {
+                cap = inflight.max(1).min(cap);
+                if inflight == 0 {
+                    stalls += 1;
+                    if stalls > 400 {
+                        out.err("[!] no se pueden abrir sockets (límite de ficheros o de puertos efímeros)".into());
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+            } else {
+                stalls = 0;
+                if cap < batch {
+                    cap = (cap + 64).min(batch); // recupera concurrencia poco a poco
+                }
+            }
+            if inflight == 0 {
+                break; // sin sockets en vuelo y sin sondas pendientes: terminado
+            }
+
+            // 2) Esperar eventos hasta el próximo vencimiento (máx. 50 ms).
+            let wait_ms = match deadlines.front() {
+                Some(&(_, _, d)) => {
+                    let us = d.saturating_duration_since(Instant::now()).as_micros() as i64;
+                    ((us + 999) / 1000).min(50) as i32
+                }
+                None => 50,
+            };
+            let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), events.len() as i32, wait_ms) };
+            if n < 0 {
+                if errno() == libc::EINTR {
+                    continue;
+                }
+                break;
+            }
+
+            // 3) Conexiones completadas.
+            for e in &events[..n as usize] {
+                let data = e.u64;
+                let idx = (data & 0xffff_ffff) as usize;
+                let gen = (data >> 32) as u32;
+                if idx >= slots.len() || !slots[idx].active || slots[idx].gen != gen {
+                    continue;
+                }
+                let (fd, ip, port) = (slots[idx].fd, slots[idx].ip, slots[idx].port);
+                let mut err: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                let r = unsafe {
+                    libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut c_void, &mut len)
+                };
+                let open = r == 0 && err == 0 && !is_self_connect(fd, ip, port);
+                unsafe { libc::close(fd) }; // cerrar el fd lo quita del epoll
+                slots[idx].active = false;
+                free.push(idx);
+                inflight -= 1;
+                if open {
+                    hit(&mut found, ip, port);
+                }
+                // ECONNREFUSED / ICMP inalcanzable: cerrado, no se reintenta.
+            }
+
+            // 4) Vencimientos (puertos filtrados o sin respuesta).
+            let now = Instant::now();
+            while let Some(&(idx, gen, d)) = deadlines.front() {
+                if d > now {
+                    break;
+                }
+                deadlines.pop_front();
+                if !slots[idx].active || slots[idx].gen != gen {
+                    continue; // ya resuelto
+                }
+                let (fd, ip, port, tries) = (slots[idx].fd, slots[idx].ip, slots[idx].port, slots[idx].tries);
+                unsafe { libc::close(fd) };
+                slots[idx].active = false;
+                free.push(idx);
+                inflight -= 1;
+                if tries < retries {
+                    retry_q.push((ip, port, tries + 1));
+                }
+            }
+        }
+
+        for s in slots.iter().filter(|s| s.active) {
+            unsafe { libc::close(s.fd) };
+        }
+        unsafe { libc::close(ep) };
+        found
+    }
+}
+
+/// Resto de sistemas: fallback con un hilo por conexión (más lento).
+#[cfg(not(target_os = "linux"))]
+mod connect_engine {
+    use super::*;
+    use std::net::{SocketAddr, TcpStream};
+
+    pub fn nofile_limit() -> usize {
+        1024
+    }
+
+    pub fn scan(
+        job: Arc<Job>,
+        perm: Arc<Perm>,
+        batch: usize,
+        _nthreads: usize,
+        timeout: Duration,
+        retries: u32,
+        out: Arc<Out>,
+    ) -> Vec<(Ipv4Addr, u16)> {
+        let np = job.ports.len() as u64;
+        let total = job.total_ips * np;
+        let next = Arc::new(AtomicU64::new(0));
+        let found: Arc<Mutex<Vec<(Ipv4Addr, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles: Vec<_> = (0..batch.min(900))
+            .map(|_| {
+                let (job, perm, next, found, out) = (job.clone(), perm.clone(), next.clone(), found.clone(), out.clone());
+                thread::spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let x = perm.get(i);
+                    let ip = job.ip_at(x / np);
+                    let port = job.ports[(x % np) as usize];
+                    if job.is_excluded(ip) {
+                        continue;
+                    }
+                    let ipa = Ipv4Addr::from(ip);
+                    let addr = SocketAddr::new(IpAddr::V4(ipa), port);
+                    let mut open = false;
+                    for _ in 0..=retries {
+                        match TcpStream::connect_timeout(&addr, timeout) {
+                            Ok(_) => {
+                                open = true;
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                            Err(_) => continue,
+                        }
+                    }
+                    if open {
+                        out.line(hit_line(ipa, port, out.oc));
+                        if let Ok(mut g) = found.lock() {
+                            g.push((ipa, port));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.join();
+        }
+        let v = found.lock().map(|g| g.clone()).unwrap_or_default();
+        v
+    }
+}
+
+// ---------- Utilidades ----------
+
 fn is_wsl() -> bool {
     fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| {
@@ -724,69 +1438,10 @@ fn is_private_172(ip: Ipv4Addr) -> bool {
     o[0] == 172 && (16..=31).contains(&o[1])
 }
 
-/// Escaneo connect(): usa la pila TCP del kernel, así que atraviesa el NAT de WSL2 sin problemas.
-fn connect_scan(
-    job: Arc<Job>,
-    perm: Arc<Perm>,
-    workers: usize,
-    timeout: Duration,
-    retries: u32,
-) -> Vec<(Ipv4Addr, u16)> {
-    let np = job.ports.len() as u64;
-    let total = job.total_ips * np;
-    let next = Arc::new(AtomicU64::new(0));
-    let found: Arc<Mutex<Vec<(Ipv4Addr, u16)>>> = Arc::new(Mutex::new(Vec::new()));
-    let color = color_on(std::io::stdout().is_terminal());
-
-    let handles: Vec<_> = (0..workers)
-        .map(|_| {
-            let (job, perm, next, found) = (job.clone(), perm.clone(), next.clone(), found.clone());
-            thread::spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= total {
-                    break;
-                }
-                let x = perm.get(i);
-                let ip = ip_at(&job.ranges, x / np);
-                let port = job.ports[(x % np) as usize];
-                if job.excl.iter().any(|&(s, c)| ip >= s && ((ip - s) as u64) < c) {
-                    continue;
-                }
-                let ipa = Ipv4Addr::from(ip);
-                let addr = SocketAddr::new(IpAddr::V4(ipa), port);
-                let mut open = false;
-                for _ in 0..=retries {
-                    match TcpStream::connect_timeout(&addr, timeout) {
-                        Ok(_) => {
-                            open = true;
-                            break;
-                        }
-                        // RST: el host responde y el puerto está cerrado, no tiene sentido reintentar
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
-                        Err(_) => continue,
-                    }
-                }
-                if open {
-                    let sep = if color { "\x1b[2m:\x1b[0m" } else { ":" };
-                    println!("{}{}{}", paint_ip(ipa, color), sep, paint_port(port, color));
-                    if let Ok(mut g) = found.lock() {
-                        g.push((ipa, port));
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        let _ = h.join();
-    }
-    let out = found.lock().map(|g| g.clone()).unwrap_or_default();
-    out
-}
-
 fn save(c: &Common, found: &[(Ipv4Addr, u16)]) {
     let write = |path: &str, text: String| {
         if let Err(e) = fs::write(path, text) {
-            eprintln!("no se pudo escribir {path}: {e}");
+            write_stderr(&format!("no se pudo escribir {path}: {e}\n"));
         }
     };
     if let Some(path) = &c.output {
@@ -814,8 +1469,19 @@ fn target_label(job: &Job) -> String {
     }
 }
 
+/// Restaura el cursor (por si la animación lo ocultó) y sale con error.
+fn die(msg: String) -> ! {
+    if std::io::stderr().is_terminal() {
+        write_stderr(CURSOR_SHOW);
+    }
+    write_stderr(&format!("error: {msg}\n"));
+    process::exit(2)
+}
+
+// ---------- Ejecución ----------
+
 fn run(job: Job, c: Common) {
-    show_banner(&c);
+    let out = Out::new();
     let seed = c.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -826,58 +1492,96 @@ fn run(job: Job, c: Common) {
     let total = job.total_ips * job.ports.len() as u64;
     let src = c.src_ip.unwrap_or_else(|| detect_src(job.ranges[0].0));
     let first = Ipv4Addr::from(job.ranges[0].0);
+    let nthreads = c.threads.max(1);
 
-    let ec = color_on(std::io::stderr().is_terminal());
+    let ec = out.ec;
     let tag = if ec { "\x1b[1;32m[+]\x1b[0m" } else { "[+]" };
     let info = if ec { "\x1b[1;38;2;255;106;0m[~]\x1b[0m" } else { "[~]" };
     let warn = if ec { "\x1b[1;33m[!]\x1b[0m" } else { "[!]" };
 
     // WSL2 en modo NAT: la IP de origen es 172.16/12 (red virtual de Hyper-V) y el destino es otra red.
     let nat = is_wsl() && is_private_172(src) && !is_private_172(first);
-    let use_connect = match c.mode {
+    let mut use_connect = match c.mode {
         Mode::Connect => true,
         Mode::Syn => false,
         Mode::Auto => nat,
     };
-    // Como RustScan: por defecto solo el destino. El resto, con --verbose.
-    eprintln!("{info} Objetivo: {}", target_label(&job));
-    if c.verbose {
-        if nat && use_connect && c.mode == Mode::Auto {
-            eprintln!("{warn} WSL2 en modo NAT (origen {src}, destino {first}): los SYN en crudo no atraviesan bien el NAT de Windows.");
-            eprintln!("    Uso escaneo connect(). Para SYN real: 'networkingMode=mirrored' en %UserProfile%\\.wslconfig y 'wsl --shutdown'.");
-        } else if nat && !use_connect {
-            eprintln!("{warn} WSL2 en modo NAT: el escaneo SYN puede no recibir respuestas de {first}. Prueba --mode connect.");
+
+    // Los raw sockets se abren ANTES de arrancar la animación: si fallan, el aviso
+    // (o el error) sale limpio, y en modo auto se cae a connect() en vez de abortar.
+    let mut socks: Option<(raw::RawSock, Vec<raw::RawSock>)> = None;
+    let mut notes: Vec<String> = Vec::new();
+    if !use_connect {
+        let opened = raw::recv_sock().and_then(|rx| {
+            let txs = (0..nthreads).map(|_| raw::send_sock()).collect::<Result<Vec<_>, _>>()?;
+            Ok((rx, txs))
+        });
+        match opened {
+            Ok(s) => socks = Some(s),
+            Err(e) if c.mode == Mode::Auto => {
+                use_connect = true;
+                notes.push(format!("{warn} sin raw sockets ({e}): uso connect(). Para SYN ejecuta con sudo o CAP_NET_RAW."));
+            }
+            Err(e) => die(format!("error abriendo raw socket (¿root / CAP_NET_RAW?): {e}")),
         }
     }
 
+    // El escaneo arranca YA; el banner se anima en paralelo (los resultados se encolan).
+    let scan_done = Arc::new(AtomicBool::new(false));
+    let banner = start_banner(&c, &out, &scan_done);
+
+    for n in notes {
+        out.err(n);
+    }
+    // Como RustScan: por defecto solo el destino. El resto, con --verbose.
+    out.err(format!("{info} Objetivo: {}", target_label(&job)));
+    if c.verbose {
+        if nat && use_connect && c.mode == Mode::Auto {
+            out.err(format!("{warn} WSL2 en modo NAT (origen {src}, destino {first}): los SYN en crudo no atraviesan bien el NAT de Windows."));
+            out.err("    Uso escaneo connect(). Para SYN real: 'networkingMode=mirrored' en %UserProfile%\\.wslconfig y 'wsl --shutdown'.".into());
+        } else if nat && !use_connect {
+            out.err(format!("{warn} WSL2 en modo NAT: el escaneo SYN puede no recibir respuestas de {first}. Prueba --mode connect."));
+        }
+    }
+
+    // ---- connect() con epoll ----
     if use_connect {
-        let workers = c.workers.clamp(1, 900);
-        let timeout = Duration::from_millis(c.timeout_ms.max(50));
+        let limit = connect_engine::nofile_limit();
+        let max_batch = limit.saturating_sub(64 + nthreads * 2).max(1);
+        let batch = c.batch.clamp(1, max_batch);
+        let timeout = Duration::from_millis(c.timeout_ms.max(20));
         if c.verbose {
-            eprintln!(
-                "[*] {} IPs x {} puertos = {} sondas | modo connect | {} workers | timeout {} ms",
+            out.err(format!(
+                "[*] {} IPs x {} puertos = {} sondas | modo connect (epoll) | {} sockets en vuelo ({} hilos) | timeout {} ms | ulimit {}",
                 job.total_ips,
                 job.ports.len(),
                 total * (c.retries as u64 + 1),
-                workers,
-                c.timeout_ms
-            );
+                batch,
+                nthreads,
+                c.timeout_ms,
+                limit
+            ));
+            if batch < c.batch {
+                out.err(format!("{warn} batch limitado a {batch} por el límite de ficheros abiertos (ulimit -n)."));
+            }
         }
         let perm = Arc::new(Perm::new(total, seed));
         let job = Arc::new(job);
         let t0 = Instant::now();
-        let mut found = connect_scan(job, perm, workers, timeout, c.retries);
+        let mut found = connect_engine::scan(job, perm, batch, nthreads, timeout, c.retries, out.clone());
         let secs = t0.elapsed().as_secs_f64();
+        finish(&scan_done, banner);
         found.sort();
-        eprintln!("{} {} abiertos | {} sondas en {:.2}s", tag, found.len(), total, secs);
+        out.err(format!("{tag} {} abiertos | {} sondas en {:.2}s", found.len(), total, secs));
         save(&c, &found);
         return;
     }
 
-    let nthreads = c.threads.max(1);
-    let rate = c.rate.unwrap_or(if job.total_ips == 1 { 10_000 } else { 100_000 });
+    // ---- SYN stateless ----
+    let (rx_sock, tx_socks) = socks.expect("raw sockets abiertos");
+    let rate = c.rate.unwrap_or(100_000);
     if c.verbose {
-        eprintln!(
+        out.err(format!(
             "[*] {} IPs x {} puertos = {} sondas | modo syn | rate {} pps | {} hilos | src {}",
             job.total_ips,
             job.ports.len(),
@@ -885,86 +1589,80 @@ fn run(job: Job, c: Common) {
             rate,
             nthreads,
             src
-        );
+        ));
     }
 
-    let (_tx, mut rx) = match transport_channel(1 << 16, Layer4(Ipv4(IpNextHeaderProtocols::Tcp))) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error abriendo raw socket (¿root / CAP_NET_RAW?): {e}");
-            process::exit(1);
-        }
-    };
-
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_rx = stop.clone();
-    let receiver = thread::spawn(move || {
-        let mut seen: HashSet<(u32, u16)> = HashSet::new();
-        let mut found: Vec<(Ipv4Addr, u16)> = Vec::new();
-        let color = color_on(std::io::stdout().is_terminal());
-        let mut it = tcp_packet_iter(&mut rx);
-        while !stop_rx.load(Ordering::Relaxed) {
-            if let Ok(Some((pkt, IpAddr::V4(ip)))) = it.next_with_timeout(Duration::from_millis(100)) {
-                if pkt.get_flags() & (TcpFlags::SYN | TcpFlags::ACK) == (TcpFlags::SYN | TcpFlags::ACK) {
-                    let dport = pkt.get_source();
-                    let sport = pkt.get_destination();
-                    let ipn = u32::from(ip);
-                    let ck = cookie(secret, ipn, dport, sport);
-                    let base = cookie(secret, ipn, dport, 0);
-                    if sport == src_port_for(base)
-                        && pkt.get_acknowledgement() == ck.wrapping_add(1)
-                        && seen.insert((ipn, dport))
-                    {
-                        let sep = if color { "\x1b[2m:\x1b[0m" } else { ":" };
-                        println!("{}{}{}", paint_ip(ip, color), sep, paint_port(dport, color));
-                        found.push((ip, dport));
-                    }
-                }
-            }
-        }
-        found
-    });
+    let last_ack = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let rcv = {
+        let (stop, out, last_ack) = (stop.clone(), out.clone(), last_ack.clone());
+        thread::spawn(move || receiver(rx_sock, stop, secret, out, t0, last_ack))
+    };
 
     let sent = Arc::new(AtomicU64::new(0));
     let job = Arc::new(job);
     let perm = Arc::new(Perm::new(total, seed));
-    let t0 = Instant::now();
-    let handles: Vec<_> = (0..nthreads)
-        .map(|id| {
+    let handles: Vec<_> = tx_socks
+        .into_iter()
+        .enumerate()
+        .map(|(id, sock)| {
             let (job, perm, sent) = (job.clone(), perm.clone(), sent.clone());
             let retries = c.retries;
-            thread::spawn(move || sender(id, nthreads, job, perm, src, secret, rate, retries, sent))
+            thread::spawn(move || sender(id, nthreads, job, perm, sock, src, secret, rate, retries, sent))
         })
         .collect();
     for h in handles {
         let _ = h.join();
     }
     let send_time = t0.elapsed().as_secs_f64();
-    if c.verbose {
-        eprintln!("[*] envío terminado, esperando {}s respuestas...", c.wait);
-    }
-    thread::sleep(Duration::from_secs(c.wait));
-    stop.store(true, Ordering::Relaxed);
-    let mut found = receiver.join().unwrap_or_default();
-    found.sort();
+    let send_end = Instant::now();
 
-    eprintln!(
+    // Espera adaptativa: máximo `wait_ms`; si ya hubo respuestas y pasan QUIET_MS sin
+    // ninguna nueva (y han pasado QUIET_MS desde el último envío), se termina.
+    let max_wait = Duration::from_millis(c.wait_ms);
+    let quiet = Duration::from_millis(QUIET_MS.min(c.wait_ms));
+    if c.verbose {
+        out.err(format!("[*] envío terminado, esperando hasta {} ms respuestas...", c.wait_ms));
+    }
+    loop {
+        let el = send_end.elapsed();
+        if el >= max_wait {
+            break;
+        }
+        let last = last_ack.load(Ordering::Relaxed);
+        if last > 0 && el >= quiet && (t0 + Duration::from_millis(last - 1)).elapsed() >= quiet {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let mut found = rcv.join().unwrap_or_default();
+    found.sort();
+    finish(&scan_done, banner);
+
+    let sent = sent.load(Ordering::Relaxed);
+    out.err(format!(
         "{} {} abiertos | {} paquetes en {:.2}s (~{:.0} pps)",
         tag,
         found.len(),
-        sent.load(Ordering::Relaxed),
+        sent,
         send_time,
-        sent.load(Ordering::Relaxed) as f64 / send_time.max(0.001)
-    );
+        sent as f64 / send_time.max(0.001)
+    ));
     if found.is_empty() && nat {
-        eprintln!("{warn} 0 respuestas: el NAT de WSL2 suele descartar los SYN-ACK. Usa --mode connect.");
+        out.err(format!("{warn} 0 respuestas: el NAT de WSL2 suele descartar los SYN-ACK. Usa --mode connect."));
     }
     save(&c, &found);
 }
 
-fn die(msg: String) -> ! {
-    eprintln!("error: {msg}");
-    process::exit(2)
+/// El escaneo terminó: avisa a la animación (corta la ola) y espera a que acabe
+/// para que vuelque los resultados encolados.
+fn finish(scan_done: &Arc<AtomicBool>, banner: Option<thread::JoinHandle<()>>) {
+    scan_done.store(true, Ordering::Relaxed);
+    if let Some(h) = banner {
+        let _ = h.join();
+    }
 }
 
 fn main() {
@@ -977,9 +1675,11 @@ fn main() {
     let common = cli.common;
     match (cli.address, cli.cmd) {
         (Some(target), None) => {
-            let ports = parse_ports(common.ports.as_deref().unwrap_or("1-65535")).unwrap_or_else(|e| die(e));
             let r = parse_target(&target).unwrap_or_else(|e| die(e));
-            run(Job { total_ips: r.1, ranges: vec![r], excl: vec![], ports }, common);
+            // Una red (CIDR con más de una IP) usa puertos comunes por defecto, como 'range'.
+            let default_ports = if r.1 > 1 { COMMON_PORTS } else { "1-65535" };
+            let ports = parse_ports(common.ports.as_deref().unwrap_or(default_ports)).unwrap_or_else(|e| die(e));
+            run(Job::new(vec![r], vec![], ports), common);
         }
         (None, Some(Cmd::Range { targets, exclude })) => {
             if targets.is_empty() {
@@ -988,13 +1688,16 @@ fn main() {
             let ports = parse_ports(common.ports.as_deref().unwrap_or(COMMON_PORTS)).unwrap_or_else(|e| die(e));
             let ranges: Vec<_> = targets.iter().map(|t| parse_target(t).unwrap_or_else(|e| die(e))).collect();
             let excl: Vec<_> = exclude.iter().map(|t| parse_target(t).unwrap_or_else(|e| die(e))).collect();
-            let total_ips = ranges.iter().map(|r| r.1).sum();
-            run(Job { ranges, excl, ports, total_ips }, common);
+            run(Job::new(ranges, excl, ports), common);
         }
         (Some(_), Some(_)) => die("usa -a <objetivo> o el subcomando 'range', no los dos a la vez".into()),
         (None, None) => {
             // Sin argumentos: banner animado + ayuda, igual que --help.
-            show_banner(&common);
+            let out = Out::new();
+            let done = Arc::new(AtomicBool::new(false));
+            if let Some(h) = start_banner(&common, &out, &done) {
+                let _ = h.join();
+            }
             let _ = Cli::command().print_help();
             println!();
         }
